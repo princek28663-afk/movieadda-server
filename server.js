@@ -1,38 +1,51 @@
 // /streaming-server/server.js
+
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
-require('dotenv').config();
+// vidsrc.ts से डिफ़ॉल्ट फंक्शन इम्पोर्ट करें
+const tmdbScrape = require('vidsrc.ts').default;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
-const TMDB_KEY = process.env.TMDB_API_KEY;
 
-// 🎯 यहाँ आप अपने असली सोर्स रेज़ॉल्वर को लगाओ
-// डेमो के लिए हम vidsrc-प्रकार का सोर्स इस्तेमाल कर रहे हैं
 async function resolveStream(tmdbId, type, season, episode) {
-    // असली दुनिया में आपको यहाँ अपना स्क्रैपर / API लगाना होगा
-    // नीचे डेमो स्ट्रीम है (Big Buck Bunny – public test video)
-    const demoStreams = {
-        movie: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
-        tv: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
-    };
+    try {
+        let result;
+        if (type === 'movie') {
+            // मूवी के लिए: TMDB ID और टाइप 'movie' पास करें
+            result = await tmdbScrape(tmdbId.toString(), "movie");
+        } else {
+            // वेब सीरीज़ के लिए: सीज़न और एपिसोड भी पास करें
+            result = await tmdbScrape(tmdbId.toString(), "tv", season, episode);
+        }
 
-    return {
-        success: true,
-        tmdbId,
-        type,
-        season: type === 'tv' ? season : null,
-        episode: type === 'tv' ? episode : null,
-        streamUrl: demoStreams[type] || demoStreams.movie,
-        // असली सोर्स के लिए यहाँ iframe URL भी दे सकते हैं
-        iframeUrl: type === 'movie'
-            ? `https://vidsrc.net/embed/movie?tmdb=${tmdbId}`
-            : `https://vidsrc.net/embed/tv?tmdb=${tmdbId}&season=${season}&episode=${episode}`
-    };
+        // vidsrc.ts एक एरे रिटर्न करता है, पहला रिजल्ट लें
+        if (result && result.length > 0 && result[0].stream) {
+            console.log(`✅ Stream found for TMDB ID ${tmdbId}`);
+            return {
+                success: true,
+                tmdbId: tmdbId,
+                type: type,
+                streamUrl: result[0].stream, // असली .m3u8 लिंक
+                referer: result[0].referer || "https://cloudnestra.com/", // ज़रूरी हेडर[reference:1]
+                sourceName: result[0].name || 'vidsrc'
+            };
+        } else {
+            throw new Error('No stream source found in scraper response.');
+        }
+    } catch (error) {
+        console.error(`❌ Scraping failed for TMDB ID ${tmdbId}:`, error.message);
+        return {
+            success: false,
+            error: 'Stream resolve failed',
+            iframeUrl: type === 'movie'
+                ? `https://vidsrc.net/embed/movie?tmdb=${tmdbId}`
+                : `https://vidsrc.net/embed/tv?tmdb=${tmdbId}&season=${season}&episode=${episode}`
+        };
+    }
 }
 
 // 🎬 स्ट्रीम लिंक देने वाला endpoint
@@ -54,11 +67,10 @@ app.get('/watch/:type/:tmdbId', async (req, res) => {
 
     } catch (err) {
         console.error(err);
-        res.status(500).json({ error: 'Stream resolve failed' });
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// हेल्थ चेक
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.listen(PORT, () => {
