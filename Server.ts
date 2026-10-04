@@ -1,260 +1,119 @@
-import { BaseProvider } from '@omss/framework';
-import type {
-    ProviderCapabilities,
-    ProviderMediaObject,
-    ProviderResult,
-    Source,
-    Subtitle
-} from '@omss/framework';
+import { OMSSServer } from '@omss/framework';
+import 'dotenv/config';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { knownThirdPartyProxies } from './thirdPartyProxies.js';
+import { streamPatterns } from './streamPatterns.js';
 
-export class VidSrcProvider extends BaseProvider {
-    readonly id = 'vidsrc';
-    readonly name = 'VidSrc';
-    readonly enabled = true;
-    readonly BASE_URL = 'https://vsembed.ru/';
-    readonly HEADERS = {
-        'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150 Safari/537.36',
-        Referer: this.BASE_URL
-    };
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-    readonly capabilities: ProviderCapabilities = {
-        supportedContentTypes: ['movies', 'tv']
-    };
+async function main() {
+    const server = new OMSSServer({
+        name: 'CinePro',
+        version: '1.0.0',
 
-    /**
-     * Fetch movie sources
-     */
-    async getMovieSources(media: ProviderMediaObject): Promise<ProviderResult> {
-        return this.getSources(media);
-    }
+        // Network
+        host: process.env.HOST ?? 'localhost',
+        port: Number(process.env.PORT ?? 3000),
+        publicUrl: process.env.PUBLIC_URL,
 
-    /**
-     * Fetch TV episode sources
-     */
-    async getTVSources(media: ProviderMediaObject): Promise<ProviderResult> {
-        return this.getSources(media);
-    }
-
-    /**
-     * Main scraping logic
-     */
-    private async getSources(
-        media: ProviderMediaObject
-    ): Promise<ProviderResult> {
-        try {
-            const pageUrl = this.buildPageUrl(media);
-
-            const html = await this.fetchPage(pageUrl, media);
-            if (!html) {
-                return this.emptyResult('Failed to fetch page', media);
+        // Cache (memory for dev, Redis for prod)
+        cache: {
+            type: (process.env.CACHE_TYPE as 'memory' | 'redis') ?? 'memory',
+            ttl: {
+                sources: 60 * 60,
+                subtitles: 60 * 60 * 24
+            },
+            redis: {
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: Number(process.env.REDIS_PORT ?? 6379),
+                password: process.env.REDIS_PASSWORD
             }
+        },
 
-            const secondUrl = this.extractSecondUrl(html);
-            if (!secondUrl) {
-                return this.emptyResult('Invalid or expired token', media);
-            }
+        // TMDB
+        tmdb: {
+            apiKey: process.env.TMDB_API_KEY!,
+            cacheTTL: 24 * 60 * 60 // 24h
+        },
 
-            const secondHtml = await this.fetchPage(secondUrl.url, media);
-            if (!secondHtml) {
-                return this.emptyResult('Failed to fetch stream page', media);
-            }
+        // Third Party Proxy removal
+        proxyConfig: {
+            knownThirdPartyProxies: knownThirdPartyProxies,
+            streamPatterns
+        },
 
-            const thirdUrl = this.extractThirdUrl(secondHtml, secondUrl.url);
-            if (!thirdUrl) {
-                return this.emptyResult('Failed to extract stream URL', media);
-            }
+        cors: {
+            origin: process.env.CORS_ORIGIN ?? '*',
+            methods: ['GET', 'OPTIONS'],
+            allowedHeaders: ['Content-Type', 'Authorization'],
+            exposedHeaders: ['Content-Range', 'Accept-Ranges', 'ETag'],
+            preflightContinue: false,
+            optionsSuccessStatus: 204
+        },
 
-            const thirdHtml = await this.fetchPage(thirdUrl.url, media);
-            if (!thirdHtml) {
-                return this.emptyResult(
-                    'Failed to fetch final stream page',
-                    media
-                );
-            }
-
-            const m3u8Urls = this.extractM3u8Urls(thirdHtml);
-            if (!m3u8Urls || m3u8Urls.length === 0) {
-                return this.emptyResult('Failed to extract m3u8 URLs', media);
-            }
-
-            const sources: Source[] = m3u8Urls.map((url) => ({
-                url: this.createProxyUrl(url, {
-                    ...this.HEADERS,
-                    Referer: 'https://cloudnestra.com/',
-                    Origin: 'https://cloudnestra.com'
-                }),
-                type: 'hls',
-                quality: 'Auto',
-                audioTracks: [
-                    {
-                        label: 'English',
-                        language: 'eng'
-                    }
-                ],
-                provider: {
-                    id: this.id,
-                    name: this.name
-                }
-            }));
-
-            return {
-                sources,
-                subtitles: [],
-                diagnostics: []
-            };
-        } catch (error) {
-            return this.emptyResult(
-                error instanceof Error
-                    ? error.message
-                    : 'Unknown provider error',
-                media
-            );
-        }
-    }
-
-    /**
-     * Build page URL based on media type
-     */
-    private buildPageUrl(media: ProviderMediaObject): string {
-        if (media.type === 'movie') {
-            return `${this.BASE_URL}/embed/movie?tmdb=${media.tmdbId}`;
-        } else {
-            return `${this.BASE_URL}/embed/tv?tmdb=${media.tmdbId}&season=${media.s}&episode=${media.e}`;
-        }
-    }
-
-    /**
-     * Fetch page HTML
-     */
-    private async fetchPage(
-        url: string,
-        media: ProviderMediaObject
-    ): Promise<string | null> {
-        try {
-            if (url.startsWith('//')) {
-                url = 'https:' + url;
-            }
-
-            const response = await fetch(url, {
-                headers: this.HEADERS
-            });
-
-            if (response.status !== 200) {
-                return null;
-            }
-
-            return await response.text();
-        } catch {
-            return null;
-        }
-    }
-
-    /**
-     * Extract token, expires, and playlist URL from HTML
-     */
-    private extractSecondUrl(html: string): { url: string } | null {
-        const src = html.match(
-            /<iframe[^>]*\s+src=["']([^"']+)["'][^>]*>/i
-        )?.[1];
-
-        if (!src) {
-            return null;
-        }
-
-        return { url: src };
-    }
-
-    /**
-     * Extract third URL from inline JS (loadIframe)
-     * and resolve it against the second URL domain
-     */
-    private extractThirdUrl(
-        html: string,
-        secondUrl: string
-    ): { url: string } | null {
-        const relSrc = html.match(/src:\s*['"]([^'"]+)['"]/i)?.[1];
-        if (!relSrc) {
-            return null;
-        }
-
-        if (secondUrl.startsWith('//')) {
-            secondUrl = 'https:' + secondUrl;
-        }
-
-        let url: string;
-        try {
-            url = new URL(relSrc, secondUrl).href;
-        } catch {
-            return null;
-        }
-
-        return { url };
-    }
-
-    private extractM3u8Urls(thirdHtml: string): string[] | null {
-        const fileField = thirdHtml.match(/file\s*:\s*["']([^"']+)["']/i)?.[1];
-        if (!fileField) return null;
-
-        const playerDomains = new Map<string, string>();
-        playerDomains.set('{v1}', 'neonhorizonworkshops.com');
-        playerDomains.set('{v2}', 'wanderlynest.com');
-        playerDomains.set('{v3}', 'orchidpixelgardens.com');
-        playerDomains.set('{v4}', 'cloudnestra.com');
-
-        const rawUrls = fileField.split(/\s+or\s+/i);
-
-        const m3u8Urls = rawUrls.map((template) => {
-            let url = template;
-            for (const [placeholder, domain] of playerDomains.entries()) {
-                url = url.replace(placeholder, domain);
-            }
-            if (url.includes('{') || url.includes('}')) {
-                return null;
-            }
-            return url;
-        });
-
-        const filteredM3u8Urls = m3u8Urls.filter(
-            (url): url is string => url !== null
-        );
-
-        return filteredM3u8Urls.length > 0 ? filteredM3u8Urls : null;
-    }
-
-    /**
-     * Return empty result with diagnostic
-     */
-    private emptyResult(
-        message: string,
-        media: ProviderMediaObject
-    ): ProviderResult {
-        return {
-            sources: [],
-            subtitles: [],
-            diagnostics: [
+        stremio: {
+            // exposes a stremio addon on /stremio/manifest.json
+            enableNativeAddon: process.env.STREMIO_ADDON === 'true',
+            // you can your own custom stremio addons as sources into cinepro.
+            stremioAddons: []
+            /*
+            stremioAddons: [
                 {
-                    code: 'PROVIDER_ERROR',
-                    message: `${this.name}: ${message}. Note that VidSrc blocks all kinds of VPN IPs, so if you are using one, try disabling it and see if that helps.`,
-                    field: '',
-                    severity: 'error'
+                    id: 'some-unique-id',
+                    url: 'https://example.com/manifest.json',
+                    enabled: true
                 }
             ]
-        };
-    }
+            */
+        },
 
-    /**
-     * Health check
-     */
-    async healthCheck(): Promise<boolean> {
-        try {
-            const response = await fetch(this.BASE_URL, {
-                method: 'HEAD',
-                headers: this.HEADERS
-            });
-            return response.status === 200;
-        } catch {
-            return false;
+        // MCP for AI agents
+        mcp: {
+            enabled: process.env.MCP_ENABLED === 'true'
         }
-    }
-              }
+    });
+
+    // Register providers
+    const registry = server.getRegistry();
+    await registry.discoverProviders(path.join(__dirname, './providers/'));
+
+    await server.start();
+
+    const publicUrl =
+        process.env.PUBLIC_URL ??
+        `http://${process.env.HOST ?? 'localhost'}:${process.env.PORT ?? 3000}`;
+
+    const uiUrl = `https://ui.cinepro.cc/?omssurl=${encodeURIComponent(publicUrl)}`;
+
+    const title = '🚀 CinePro/ui is in public testing';
+    const contrib =
+        '🤝 We are looking for contributors to improve and develop!';
+    const repo = 'Contribute: https://github.com/cinepro-org/ui';
+    const tryIt = `🌐 Try it out: ${uiUrl} !`;
+    const note =
+        'You will need to give the website "access to local applications" that it works.';
+
+    const lines = [title, '', repo, '', contrib, '', tryIt, '', note];
+
+    // compute box width based on longest line
+    const width = Math.max(...lines.map((l) => l.length)) + 2;
+
+    const borderTop = '╭' + '─'.repeat(width) + '╮';
+    const borderBottom = '╰' + '─'.repeat(width) + '╯';
+
+    const pad = (line: string) => '│ ' + line.padEnd(width - 2, ' ') + ' │';
+
+    console.log(`
+================== CINEPRO BETA ANNOUNCEMENT ==================
+
+${borderTop}
+${lines.map(pad).join('\n')}
+${borderBottom}
+`);
+}
+
+main().catch(() => {
+    process.exit(1);
+});
